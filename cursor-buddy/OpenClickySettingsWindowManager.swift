@@ -214,6 +214,13 @@ struct OpenClickySettingsView: View {
     @AppStorage(AppBundleConfiguration.userGlassOpacityDefaultsKey) private var glassOpacity = 0.75
     @AppStorage(AppBundleConfiguration.userGlassFrostingDefaultsKey) private var glassFrosting = 0.20
     @AppStorage(AppBundleConfiguration.userThemeDefaultsKey) private var clickyTheme = ClickyTheme.system.rawValue
+    // Phase 1c — Brain Provider seam (clank-voice → openclicky integration).
+    // Keys match BrainProviderFactory.userPreferenceKey, CompanionManager
+    // .useBrainProviderDefaultsKey, and RemoteClankSessionProvider
+    // .userBaseURLDefaultsKey respectively. See cursor-buddy/Brain/.
+    @AppStorage("ClankBrainProvider") private var brainProviderID = BrainProviderID.remoteClankSession.rawValue
+    @AppStorage("ClankUseBrainProvider") private var useBrainProvider = false
+    @AppStorage("ClankBrainProviderRemoteURL") private var brainProviderRemoteURL = RemoteClankSessionProvider.defaultBaseURL
     @State private var selectedSection: OpenClickySettingsSection = .general
     @State private var gogCLIStatus = OpenClickyGogCLIStatus.unknown
     @State private var isRefreshingGogCLIStatus = false
@@ -721,6 +728,40 @@ struct OpenClickySettingsView: View {
                         )
                     }
                 }
+            }
+
+            // Phase 1c — Brain Provider seam (clank-voice → openclicky integration).
+            // Toggle activates the BrainProvider routing path in CompanionManager
+            // (gated behind ClankUseBrainProvider — default false for rollback safety).
+            // Picker selects between the Mac-Mini-hosted Clank session and direct
+            // Anthropic API. URL field is read by RemoteClankSessionProvider on init.
+            settingsGroup("Brain Provider — Clank session vs cloud Claude") {
+                toggleRow(
+                    title: "Route brain through Clank session",
+                    subtitle: "When ON, voice + ask responses flow through the BrainProvider seam (clank-voice file-inbox relay or Anthropic direct, per the picker below). When OFF (default), the legacy direct ClaudeAPI path runs unchanged.",
+                    systemImageName: "brain.head.profile",
+                    isOn: $useBrainProvider
+                )
+
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                    ForEach(BrainProviderID.allCases) { provider in
+                        optionButton(
+                            title: provider.label,
+                            subtitle: provider.subtitle,
+                            isSelected: brainProviderID == provider.rawValue,
+                            action: { brainProviderID = provider.rawValue }
+                        )
+                    }
+                }
+                .padding(14)
+
+                textFieldRow(
+                    title: "Remote Clank Session URL",
+                    subtitle: "Base URL of the clank-voice FastAPI server. Defaults to the Mac Mini over Tailscale (http://localhost:8420). Restart the app after changing.",
+                    systemImageName: "network",
+                    placeholder: RemoteClankSessionProvider.defaultBaseURL,
+                    text: $brainProviderRemoteURL
+                )
             }
 
             settingsGroup("Response captions") {

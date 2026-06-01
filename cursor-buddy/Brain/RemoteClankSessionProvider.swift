@@ -43,8 +43,20 @@ final class RemoteClankSessionProvider: BrainProvider {
     /// but the OLD request's SSE loop still has queued audio events.
     private var playbackGeneration: Int = 0
 
-    init(baseURL: String = "http://localhost:8420") {
-        self.baseURL = baseURL
+    /// UserDefaults key the Settings UI writes the base URL to. If unset,
+    /// the Phase 1c default (Tailscale-routed Mac Mini) is used.
+    static let userBaseURLDefaultsKey = "ClankBrainProviderRemoteURL"
+    static let defaultBaseURL = "http://localhost:8420"
+
+    init(baseURL: String? = nil) {
+        if let explicit = baseURL, !explicit.isEmpty {
+            self.baseURL = explicit
+        } else if let stored = UserDefaults.standard.string(forKey: Self.userBaseURLDefaultsKey),
+                  !stored.trimmingCharacters(in: .whitespaces).isEmpty {
+            self.baseURL = stored
+        } else {
+            self.baseURL = Self.defaultBaseURL
+        }
     }
 
     // MARK: - BrainProvider conformance (display + isConfigured)
