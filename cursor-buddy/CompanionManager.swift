@@ -519,6 +519,27 @@ final class CompanionManager: ObservableObject {
         )
     }()
 
+    // MARK: - BrainProvider seam (Phase 1c)
+    //
+    // Phase 1c of the clank-voice → openclicky integration. Lazy-init the
+    // BrainProvider via BrainProviderFactory; gated at use-sites behind
+    // `useBrainProvider` (UserDefaults["ClankUseBrainProvider"], default
+    // false) so the existing claudeAPI code path stays the rollback-safe
+    // default. When the flag flips true, analyzeClaudeResponse routes the
+    // streaming call through BrainProvider.submit + streamEvents instead.
+    // See wiki/projects/clank-spine.md §5 + wiki/projects/clank-openclicky-integration.md §4a.
+    private static let useBrainProviderDefaultsKey = "ClankUseBrainProvider"
+
+    /// Read fresh on every call so Settings UI toggles take effect without
+    /// requiring an app restart.
+    var useBrainProvider: Bool {
+        UserDefaults.standard.object(forKey: Self.useBrainProviderDefaultsKey) as? Bool ?? false
+    }
+
+    private lazy var brainProvider: any BrainProvider = {
+        BrainProviderFactory.makeDefaultProvider(claudeAPI: claudeAPI)
+    }()
+
     private lazy var openAIAPI: OpenAIAPI = {
         let modelOption = OpenClickyModelCatalog.voiceAnalysisModel(withID: selectedModel)
         return OpenAIAPI(
@@ -14536,15 +14557,32 @@ final class CompanionManager: ObservableObject {
             do {
                 claudeAPI.model = modelOption.id
                 claudeAPI.maxOutputTokens = modelOption.maxOutputTokens
-                print("🧠 analyzeClaudeResponse: using direct HTTP streaming (ClaudeAPI)")
-                let (text, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: images,
-                    systemPrompt: systemPrompt,
-                    conversationHistory: conversationHistory,
-                    userPrompt: userPrompt,
-                    assistantPrefill: assistantPrefill,
-                    onTextChunk: onTextChunk
-                )
+                // Phase 1c: when the BrainProvider gate is on, route the
+                // streaming call through brainProvider.submit + streamEvents
+                // instead of touching claudeAPI directly. The text + chunk
+                // surface is preserved so the caller sees no difference.
+                // Rollback-safe: default-false flag falls through to the
+                // existing direct claudeAPI path below.
+                let text: String
+                if useBrainProvider {
+                    print("🧠 analyzeClaudeResponse: routing via BrainProvider (\(brainProvider.displayName))")
+                    text = try await analyzeViaBrainProvider(
+                        images: images,
+                        userPrompt: userPrompt,
+                        onTextChunk: onTextChunk
+                    )
+                } else {
+                    print("🧠 analyzeClaudeResponse: using direct HTTP streaming (ClaudeAPI)")
+                    let (rawText, _) = try await claudeAPI.analyzeImageStreaming(
+                        images: images,
+                        systemPrompt: systemPrompt,
+                        conversationHistory: conversationHistory,
+                        userPrompt: userPrompt,
+                        assistantPrefill: assistantPrefill,
+                        onTextChunk: onTextChunk
+                    )
+                    text = rawText
+                }
                 return text
             } catch {
                 guard claudeAgentSDKAPI != nil else { throw error }
@@ -14582,6 +14620,78 @@ final class CompanionManager: ObservableObject {
             code: -1,
             userInfo: [NSLocalizedDescriptionKey: "Claude is not configured. Sign in to Claude Code locally or set an Anthropic API key."]
         )
+    }
+
+    // MARK: - BrainProvider streaming adapter (Phase 1c)
+    //
+    // Translates `analyzeClaudeResponse`'s call signature into a single
+    // round-trip through the BrainProvider seam. The first image (if any)
+    // becomes `context.screenshot`; remaining images become attachments.
+    // Each `.response(text:)` SSE event drives `onTextChunk(text)` so the
+    // existing UI surfaces the same progressive-render UX. Caller's
+    // systemPrompt / conversationHistory / assistantPrefill are intentionally
+    // dropped — the remote brain (Claude Code session) owns persona +
+    // history server-side; LocalAnthropicProvider has its own minimal
+    // system prompt baked in. Phase 1c trade-off documented in
+    // wiki/projects/clank-spine.md §5.3.
+    private func analyzeViaBrainProvider(
+        images: [(data: Data, label: String)],
+        userPrompt: String,
+        onTextChunk: @MainActor @Sendable @escaping (String) -> Void
+    ) async throws -> String {
+        let requestId = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8))
+
+        let context: BrainScreenContext?
+        var attachments: [BrainAttachment] = []
+        if let primary = images.first {
+            context = BrainScreenContext(
+                screenshot: primary.data,
+                activeApp: NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown",
+                chromeURL: nil,
+                chromeTitle: nil
+            )
+            for extra in images.dropFirst() {
+                attachments.append(.image(extra.data))
+            }
+        } else {
+            context = nil
+        }
+
+        _ = try await brainProvider.submit(
+            requestId: requestId,
+            text: userPrompt,
+            audio: nil,
+            context: context,
+            attachments: attachments
+        )
+
+        var latestText = ""
+        for await event in brainProvider.streamEvents(requestId: requestId) {
+            switch event {
+            case .response(let text):
+                latestText = text
+                // ClaudeAPI's onTextChunk contract: callback runs on main
+                // actor with the FULL accumulated text. BrainStreamEvent
+                // `.response(text:)` follows the same shape (see
+                // clank-voice ClankClient.swift::streamEvents).
+                await MainActor.run { onTextChunk(text) }
+            case .error(let detail):
+                throw NSError(
+                    domain: "BrainProvider",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: detail]
+                )
+            case .done:
+                return latestText
+            default:
+                // Channel events (status / log / question / open-url / etc.)
+                // are not consumed by analyzeClaudeResponse — they reach
+                // higher layers via the panel-view streamEvents consumer
+                // wired in Task 5.
+                break
+            }
+        }
+        return latestText
     }
 
     private func analyzeOpenAIOrCodexVoiceResponse(
