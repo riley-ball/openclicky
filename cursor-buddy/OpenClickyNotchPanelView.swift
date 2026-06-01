@@ -2518,6 +2518,16 @@ struct OpenClickyNotchPanelView: View {
         // Empty submit does nothing -- previously this fell back to the legacy
         // expandTextInput dialog ("Ask OpenClicky / Voice / Text / Agent"),
         // which is being retired in favor of this in-panel prompt surface.
+        //
+        // Phase 1c (clank-voice → openclicky integration): when
+        // UserDefaults["ClankUseBrainProvider"] == true, the call below to
+        // `companionManager.submitTextPrompt(...)` is re-routed through the
+        // BrainProvider seam (CompanionManager.analyzeViaBrainProvider — see
+        // wiki/projects/clank-spine.md §5). Default false; rollback-safe.
+        // The text-chunk surface is preserved so this view sees the same
+        // progressive-render UX in both modes. Question / open-url cards
+        // arrive in Phase 2; this view has no card slot yet — those events
+        // are no-op'd in CompanionManager.analyzeViaBrainProvider's switch.
         guard !trimmedPrompt.isEmpty || !attachments.isEmpty else { return }
 
         quickPrompt = ""

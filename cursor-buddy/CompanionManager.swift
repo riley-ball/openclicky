@@ -540,6 +540,13 @@ final class CompanionManager: ObservableObject {
         BrainProviderFactory.makeDefaultProvider(claudeAPI: claudeAPI)
     }()
 
+    /// Tracks whether the long-lived `streamPush()` consumer has been kicked
+    /// off in this session. Lazily started on the first BrainProvider-routed
+    /// request (see `startBrainPushConsumerIfNeeded`). One per app session
+    /// per wiki/projects/clank-spine.md §8.2.
+    private var brainPushConsumerStarted: Bool = false
+    private var brainPushConsumerTask: Task<Void, Never>?
+
     private lazy var openAIAPI: OpenAIAPI = {
         let modelOption = OpenClickyModelCatalog.voiceAnalysisModel(withID: selectedModel)
         return OpenAIAPI(
@@ -14639,6 +14646,7 @@ final class CompanionManager: ObservableObject {
         userPrompt: String,
         onTextChunk: @MainActor @Sendable @escaping (String) -> Void
     ) async throws -> String {
+        startBrainPushConsumerIfNeeded()
         let requestId = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8))
 
         let context: BrainScreenContext?
@@ -14692,6 +14700,43 @@ final class CompanionManager: ObservableObject {
             }
         }
         return latestText
+    }
+
+    /// Start the long-lived push channel consumer if it hasn't been started
+    /// yet this session. The push channel (`/v1/push`) surfaces unsolicited
+    /// brain messages + orphan-promoted responses (clank-spine.md §8). For
+    /// Phase 1c we log events and post `.clickyShowPanel` on receipt so the
+    /// panel surfaces — question / open-url cards arrive in Phase 2. Idempotent
+    /// per session; rebinds on each toggle of useBrainProvider is intentional.
+    private func startBrainPushConsumerIfNeeded() {
+        guard !brainPushConsumerStarted else { return }
+        brainPushConsumerStarted = true
+        brainPushConsumerTask = Task { [weak self] in
+            guard let self = self else { return }
+            // Reconnect loop: AsyncStream finishes on disconnect; spin a new
+            // subscription per the per-stream cancellation semantics in
+            // RemoteClankSessionProvider.streamPush. Phase 5 will tighten the
+            // backoff; Phase 1c uses a fixed 2-second nap.
+            while !Task.isCancelled {
+                for await event in self.brainProvider.streamPush() {
+                    switch event {
+                    case .push(let text, _, let source):
+                        print("🧠 BrainPush[push]: source=\(source) text.count=\(text.count)")
+                        NotificationCenter.default.post(name: .clickyShowPanel, object: nil)
+                    case .openURL(let data):
+                        // Phase 1c: log only. Phase 2 surfaces an OpenURLCard.
+                        print("🧠 BrainPush[open-url]: id=\(data.id) url=\(data.url)")
+                        NotificationCenter.default.post(name: .clickyShowPanel, object: nil)
+                    case .question(let data):
+                        // Phase 1c: log only. Phase 2 surfaces a QuestionCard.
+                        print("🧠 BrainPush[question]: id=\(data.id) options=\(data.options.count)")
+                        NotificationCenter.default.post(name: .clickyShowPanel, object: nil)
+                    }
+                }
+                if Task.isCancelled { break }
+                try? await Task.sleep(nanoseconds: 2 * 1_000_000_000)
+            }
+        }
     }
 
     private func analyzeOpenAIOrCodexVoiceResponse(
